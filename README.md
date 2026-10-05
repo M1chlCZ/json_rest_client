@@ -112,9 +112,15 @@ value is empty, the header is omitted. Customize the key and scheme per base
 URL:
 
 ```dart
+final store = AppTokenStore();
+
+Future<String?> refreshPosToken() async {
+  return store.read('posRefreshToken');
+}
+
 final posClient = JsonRestClient(
   baseUrl: 'https://pos.example.com/api/',
-  tokenStore: AppTokenStore(),
+  tokenStore: store,
   authScheme: 'JWT',
   authTokenKey: 'posToken',
   onUnauthorized: refreshPosToken,
@@ -161,7 +167,8 @@ later entries winning:
 
 ## Exceptions
 
-Every failure throws a subtype of the sealed `RestClientException`:
+Every failure detected by the client itself throws a subtype of the sealed
+`RestClientException`:
 
 | Exception | Condition |
 | --- | --- |
@@ -174,6 +181,10 @@ Every failure throws a subtype of the sealed `RestClientException`:
 | `InvalidInputException` | The server responded with `422`. |
 | `ServerErrorException` | The server responded with `500` or any other non-2xx status. |
 | `DeserializationException` | The body was not valid JSON, or it could not be cast to `T`. |
+
+Errors thrown by caller-supplied callbacks (`decoder`, `onUnauthorized`,
+`tokenStore`, `userAgentProvider`) and JSON-encoding failures of an unsupported
+`body` propagate unchanged.
 
 For HTTP status errors, `message` is the raw response body; the fallback
 `'HTTP <status>'` is used only when the body is empty.

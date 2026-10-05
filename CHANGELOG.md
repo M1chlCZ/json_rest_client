@@ -8,6 +8,9 @@
   timeout, HTTP status, and deserialization failures.
 - HTTP status exceptions carry the raw response body as `message`, falling
   back to `'HTTP <status>'` only when the body is empty.
+- Errors thrown by caller-supplied callbacks (`decoder`, `onUnauthorized`,
+  `tokenStore`, `userAgentProvider`) and JSON-encoding failures of an
+  unsupported `body` propagate unchanged.
 - Added single-flight refresh on `401`/`403`: the token returned by
   `onUnauthorized` is used for exactly one retry, and a missing token or a
   still-unauthorized retry raises `UnauthorizedException`.
