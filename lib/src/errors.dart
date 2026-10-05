@@ -1,9 +1,15 @@
 /// Base class for all exceptions thrown by the JSON REST client.
+///
+/// For HTTP status errors the [message] is the raw response body; the
+/// `'HTTP <status>'` fallback is used only when that body is empty.
 sealed class RestClientException implements Exception {
-  /// Creates an exception with a human-readable [message].
+  /// Creates an exception whose [message] describes the failure.
   const RestClientException(this.message);
 
   /// Human-readable description of the failure.
+  ///
+  /// HTTP status exceptions carry the raw response body here, or
+  /// `'HTTP <status>'` when the body is empty.
   final String message;
 
   @override

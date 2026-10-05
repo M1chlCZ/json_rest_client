@@ -370,4 +370,38 @@ void main() {
       throwsA(isA<DeserializationException>()),
     );
   });
+
+  test('exposes the raw response body on HTTP status errors', () async {
+    final client = clientWith(
+      MockClient((request) async => http.Response('{"error":"boom"}', 409)),
+    );
+
+    await expectLater(
+      client.get('x'),
+      throwsA(
+        isA<ConflictDataException>().having(
+          (error) => error.message,
+          'message',
+          '{"error":"boom"}',
+        ),
+      ),
+    );
+  });
+
+  test('falls back to the status code when the error body is empty', () async {
+    final client = clientWith(
+      MockClient((request) async => http.Response('', 500)),
+    );
+
+    await expectLater(
+      client.get('x'),
+      throwsA(
+        isA<ServerErrorException>().having(
+          (error) => error.message,
+          'message',
+          'HTTP 500',
+        ),
+      ),
+    );
+  });
 }

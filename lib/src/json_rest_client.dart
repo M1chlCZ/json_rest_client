@@ -112,6 +112,10 @@ class JsonRestClient {
   /// body is JSON-decoded and passed to [decoder] when provided; without a
   /// decoder the decoded value is cast to `T?`.
   ///
+  /// HTTP status errors throw the matching [RestClientException] subtype whose
+  /// [RestClientException.message] is the raw response body, or
+  /// `'HTTP <status>'` when the body is empty.
+  ///
   /// [debug] is accepted for call-site compatibility and has no effect; this
   /// client never logs.
   Future<T?> get<T>(
@@ -322,6 +326,8 @@ class JsonRestClient {
     }
   }
 
+  /// Maps a non-success response to a typed exception whose message is the raw
+  /// response body, or `'HTTP <status>'` when that body is empty.
   RestClientException _mapStatusError(http.Response response) {
     final message = _errorMessage(response);
     return switch (response.statusCode) {
@@ -335,11 +341,10 @@ class JsonRestClient {
   }
 
   String _errorMessage(http.Response response) {
-    final body = response.body.trim();
-    if (body.isEmpty) {
+    if (response.body.trim().isEmpty) {
       return 'HTTP ${response.statusCode}';
     }
-    return 'HTTP ${response.statusCode}: $body';
+    return response.body;
   }
 }
 
