@@ -20,7 +20,8 @@ typedef UserAgentProvider = Future<String> Function();
 /// storage, user-agent injection, and single-flight refresh-on-`401` retries.
 ///
 /// Request paths are always resolved relative to [baseUrl]; a leading `/` on a
-/// path is ignored so it cannot escape the base directory.
+/// path is ignored. Absolute URI paths are not supported and should not be
+/// passed.
 ///
 /// Instances are reusable for the lifetime of the app. When no [http.Client] is
 /// injected, an internal one is created and released by [close]; an injected
