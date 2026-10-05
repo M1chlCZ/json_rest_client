@@ -4,8 +4,8 @@ description: >-
   pluggable auth token storage, user-agent injection, and
   refresh-on-401 retry with a single-flight refresh lock.
 version: 0.1.0
-repository: https://github.com/M1chlCZ/Rocketbot-App-New/tree/main/packages/json_rest_client
-issue_tracker: https://github.com/M1chlCZ/Rocketbot-App-New/issues
+repository: https://github.com/M1chlCZ/json_rest_client
+issue_tracker: https://github.com/M1chlCZ/json_rest_client/issues
 topics:
   - http
   - rest
