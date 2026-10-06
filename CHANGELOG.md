@@ -1,3 +1,13 @@
+## 0.1.1
+
+- `RestClientException` and every subtype now expose the `statusCode` and
+  `headers` of the response that caused the failure, when one exists.
+- Added `RestResponse` and `JsonRestClient.sendRaw` for status-and-bytes
+  access without JSON decoding or error mapping.
+- Added `ResponseLimitException`, thrown by `sendRaw` when a response body
+  exceeds `maxResponseBytes`; the body stream is abandoned as soon as the
+  limit is crossed.
+
 ## 0.1.0
 
 - Initial release: extracted the app's networking layer into a standalone,

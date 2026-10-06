@@ -3,7 +3,7 @@ description: >-
   A small, dependency-light JSON HTTP client with typed exceptions,
   pluggable auth token storage, user-agent injection, and
   refresh-on-401 retry with a single-flight refresh lock.
-version: 0.1.0
+version: 0.1.1
 repository: https://github.com/M1chlCZ/json_rest_client
 issue_tracker: https://github.com/M1chlCZ/json_rest_client/issues
 topics:

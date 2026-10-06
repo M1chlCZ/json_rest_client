@@ -404,4 +404,47 @@ void main() {
       ),
     );
   });
+
+  test('exposes status code and headers on HTTP errors', () async {
+    final client = clientWith(
+      MockClient((request) async {
+        return http.Response('busy', 503, headers: {'retry-after': '7'});
+      }),
+    );
+
+    await expectLater(
+      client.get('x'),
+      throwsA(
+        isA<ServerErrorException>()
+            .having((e) => e.statusCode, 'statusCode', 503)
+            .having((e) => e.headers?['retry-after'], 'retry-after', '7'),
+      ),
+    );
+  });
+
+  test('sendRaw returns the status, headers, and bytes', () async {
+    final client = clientWith(
+      MockClient((request) async {
+        return http.Response.bytes([1, 2, 3], 201, headers: {'x-a': 'b'});
+      }),
+    );
+
+    final response = await client.sendRaw('GET', path: 'x');
+    expect(response.statusCode, 201);
+    expect(response.headers['x-a'], 'b');
+    expect(response.bodyBytes, [1, 2, 3]);
+  });
+
+  test('sendRaw enforces maxResponseBytes', () async {
+    final client = clientWith(
+      MockClient((request) async {
+        return http.Response.bytes(List<int>.filled(64, 0), 200);
+      }),
+    );
+
+    await expectLater(
+      client.sendRaw('GET', path: 'x', maxResponseBytes: 16),
+      throwsA(isA<ResponseLimitException>()),
+    );
+  });
 }

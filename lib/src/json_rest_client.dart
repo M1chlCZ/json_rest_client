@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:http/http.dart' as http;
 
@@ -15,6 +16,31 @@ typedef TokenRefresher = Future<String?> Function();
 
 /// Resolves the `user-agent` value used for outgoing requests.
 typedef UserAgentProvider = Future<String> Function();
+
+/// A raw HTTP response returned by [JsonRestClient.sendRaw].
+///
+/// Every HTTP status is returned as-is; non-success statuses are not mapped to
+/// exceptions.
+class RestResponse {
+  /// Creates a raw response from its [statusCode], [headers], and [bodyBytes].
+  const RestResponse({
+    required this.statusCode,
+    required this.headers,
+    required this.bodyBytes,
+  });
+
+  /// HTTP status code of the response.
+  final int statusCode;
+
+  /// Response headers with lowercased names, as provided by `package:http`.
+  final Map<String, String> headers;
+
+  /// Raw response body bytes exactly as received.
+  final Uint8List bodyBytes;
+
+  /// The body decoded as UTF-8, replacing malformed sequences.
+  String get body => utf8.decode(bodyBytes, allowMalformed: true);
+}
 
 /// A small JSON-over-HTTP client with typed exceptions, pluggable token
 /// storage, user-agent injection, and single-flight refresh-on-`401` retries.
@@ -166,6 +192,62 @@ class JsonRestClient {
     );
   }
 
+  /// Sends [method] to exactly one of [path] or [url] and returns the raw
+  /// response.
+  ///
+  /// Provide either [path], which resolves relative to [baseUrl] with the same
+  /// rules as [get], or an absolute [url]; providing both or neither throws an
+  /// [ArgumentError]. [body] is JSON-encoded when it is not `null`. Headers
+  /// merge in the same order as [get] and [post]: [defaultHeaders], the
+  /// computed `user-agent`, an `application/json` content type when [body] is
+  /// not `null`, then per-call [headers]; names match case-insensitively and
+  /// per-call values win. [timeout] overrides [timeout] for this call.
+  ///
+  /// A [RestResponse] is returned for every HTTP status; non-success statuses
+  /// do not throw and the refresh-on-`401` path is not used. When
+  /// [maxResponseBytes] is set and the body grows past it, reading stops and a
+  /// [ResponseLimitException] is thrown.
+  ///
+  /// Network failures throw [NetworkException] and exceeding the timeout
+  /// throws [RequestTimeoutException].
+  Future<RestResponse> sendRaw(
+    String method, {
+    String? path,
+    Uri? url,
+    Object? body,
+    Map<String, String>? headers,
+    Duration? timeout,
+    int? maxResponseBytes,
+  }) async {
+    if ((path == null) == (url == null)) {
+      throw ArgumentError('Exactly one of path and url must be provided.');
+    }
+    final uri = url ?? _buildUri(path!, null);
+    final requestTimeout = timeout ?? this.timeout;
+    final requestHeaders = await _buildHeaders(
+      auth: false,
+      isPost: body != null,
+      extra: headers,
+    );
+    try {
+      return await _sendRaw(
+        method: method,
+        uri: uri,
+        headers: requestHeaders,
+        body: body,
+        maxResponseBytes: maxResponseBytes,
+      ).timeout(requestTimeout);
+    } on TimeoutException {
+      throw RequestTimeoutException(
+        '$method $uri timed out after ${requestTimeout.inMilliseconds} ms',
+      );
+    } on SocketException catch (error) {
+      throw NetworkException(error.message);
+    } on http.ClientException catch (error) {
+      throw NetworkException(error.message);
+    }
+  }
+
   Future<T?> _request<T>({
     required String method,
     required String path,
@@ -191,13 +273,21 @@ class JsonRestClient {
     if (response.statusCode == 401 || response.statusCode == 403) {
       final refresher = onUnauthorized;
       if (refresher == null) {
-        throw UnauthorizedException(_errorMessage(response));
+        throw UnauthorizedException(
+          _errorMessage(response),
+          statusCode: response.statusCode,
+          headers: response.headers,
+        );
       }
       final token = await (_refreshInFlight ??= refresher().whenComplete(() {
         _refreshInFlight = null;
       }));
       if (token == null || token.isEmpty) {
-        throw UnauthorizedException(_errorMessage(response));
+        throw UnauthorizedException(
+          _errorMessage(response),
+          statusCode: response.statusCode,
+          headers: response.headers,
+        );
       }
       response = await _send(
         method: method,
@@ -212,7 +302,11 @@ class JsonRestClient {
         timeout: requestTimeout,
       );
       if (response.statusCode == 401 || response.statusCode == 403) {
-        throw UnauthorizedException(_errorMessage(response));
+        throw UnauthorizedException(
+          _errorMessage(response),
+          statusCode: response.statusCode,
+          headers: response.headers,
+        );
       }
     }
 
@@ -303,27 +397,66 @@ class JsonRestClient {
     return http.Response.fromStream(streamedResponse);
   }
 
+  Future<RestResponse> _sendRaw({
+    required String method,
+    required Uri uri,
+    required Map<String, String> headers,
+    Object? body,
+    int? maxResponseBytes,
+  }) async {
+    final request = http.Request(method, uri);
+    request.headers.addAll(headers);
+    if (body != null) {
+      request.bodyBytes = utf8.encode(jsonEncode(body));
+    }
+    final streamedResponse = await _client.send(request);
+    final builder = BytesBuilder(copy: false);
+    await for (final chunk in streamedResponse.stream) {
+      builder.add(chunk);
+      if (maxResponseBytes != null && builder.length > maxResponseBytes) {
+        throw ResponseLimitException(
+          '$method $uri response exceeds $maxResponseBytes bytes',
+          statusCode: streamedResponse.statusCode,
+          headers: streamedResponse.headers,
+        );
+      }
+    }
+    return RestResponse(
+      statusCode: streamedResponse.statusCode,
+      headers: streamedResponse.headers,
+      bodyBytes: builder.takeBytes(),
+    );
+  }
+
   T? _decode<T>(http.Response response, T Function(dynamic json)? decoder) {
     final body = response.body;
     if (body.trim().isEmpty) {
       return null;
     }
-    final decoded = _jsonDecode(body);
+    final decoded = _jsonDecode(response);
     if (decoder != null) {
       return decoder(decoded);
     }
     try {
       return decoded as T?;
     } on TypeError catch (error) {
-      throw DeserializationException(error.toString());
+      throw DeserializationException(
+        error.toString(),
+        statusCode: response.statusCode,
+        headers: response.headers,
+      );
     }
   }
 
-  dynamic _jsonDecode(String body) {
+  dynamic _jsonDecode(http.Response response) {
     try {
-      return jsonDecode(body);
+      return jsonDecode(response.body);
     } on FormatException catch (error) {
-      throw DeserializationException(error.message);
+      throw DeserializationException(
+        error.message,
+        statusCode: response.statusCode,
+        headers: response.headers,
+      );
     }
   }
 
@@ -331,13 +464,39 @@ class JsonRestClient {
   /// response body, or `'HTTP <status>'` when that body is empty.
   RestClientException _mapStatusError(http.Response response) {
     final message = _errorMessage(response);
-    return switch (response.statusCode) {
-      400 => BadRequestException(message),
-      404 => NotFoundException(message),
-      409 => ConflictDataException(message),
-      422 => InvalidInputException(message),
-      500 => ServerErrorException(message),
-      _ => ServerErrorException(message),
+    final statusCode = response.statusCode;
+    final headers = response.headers;
+    return switch (statusCode) {
+      400 => BadRequestException(
+        message,
+        statusCode: statusCode,
+        headers: headers,
+      ),
+      404 => NotFoundException(
+        message,
+        statusCode: statusCode,
+        headers: headers,
+      ),
+      409 => ConflictDataException(
+        message,
+        statusCode: statusCode,
+        headers: headers,
+      ),
+      422 => InvalidInputException(
+        message,
+        statusCode: statusCode,
+        headers: headers,
+      ),
+      500 => ServerErrorException(
+        message,
+        statusCode: statusCode,
+        headers: headers,
+      ),
+      _ => ServerErrorException(
+        message,
+        statusCode: statusCode,
+        headers: headers,
+      ),
     };
   }
 
