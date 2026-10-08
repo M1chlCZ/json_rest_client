@@ -1,3 +1,8 @@
+## 0.1.2
+
+- Rewrite the README. Document `sendRaw`, `RestResponse`,
+  `ResponseLimitException`, and the refresh rules.
+
 ## 0.1.1
 
 - `RestClientException` and every subtype now expose the `statusCode` and

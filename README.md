@@ -1,21 +1,20 @@
 # json_rest_client
 
-A small, dependency-light JSON HTTP client for Dart with typed exceptions,
-pluggable auth token storage, user-agent injection, and refresh-on-`401` retry
-with a single-flight refresh lock. It is a thin wrapper around
-[`package:http`](https://pub.dev/packages/http) that removes the repeated
-response-decoding and error-mapping boilerplate from an app's networking layer.
+A small JSON HTTP client for Dart with typed exceptions, pluggable auth token
+storage, user-agent injection, and refresh-on-`401` retry. The package wraps
+[`package:http`](https://pub.dev/packages/http) and removes repeated
+response-decoding and error-mapping code from an app's networking layer.
 
 ## Features
 
-- `get` and `post` helpers that JSON-decode response bodies automatically.
+- `get` and `post` helpers that JSON-decode response bodies
+- `sendRaw` for status and bytes access without decoding
 - Typed exceptions for network, timeout, HTTP status, and deserialization
-  failures.
-- Auth tokens read from a host-provided `TokenStore`.
-- Single-flight token refresh on `401`/`403`, followed by one retry with the
-  refreshed token.
-- Case-insensitive header merging with per-call overrides.
-- Configurable base URL, default timeout, auth scheme, token key, and headers.
+  failures
+- Auth tokens from a host-provided `TokenStore`
+- Single-flight token refresh on `401` or `403`, then one retry
+- Case-insensitive header merging with per-call overrides
+- Configurable base URL, timeout, auth scheme, token key, and headers
 
 ## Install
 
@@ -48,165 +47,116 @@ Future<void> main() async {
 }
 ```
 
-In a Flutter app, back the `TokenStore` with `flutter_secure_storage` (or any
-other persistence layer) and create one `JsonRestClient` per base URL for the
-lifetime of the app.
+In a Flutter app, back the `TokenStore` with `flutter_secure_storage`. Create
+one `JsonRestClient` per base URL for the lifetime of the app.
 
 ## Configuration
 
-| Parameter | Type | Default | Purpose |
-| --- | --- | --- | --- |
-| `baseUrl` | `String` | required | Directory prefix for every request path. A trailing `/` is added when missing. |
-| `client` | `http.Client?` | `null` | Optional injected HTTP client. When injected, `close()` does not close it. |
-| `tokenStore` | `TokenStore` | required | Reads the auth token for `auth: true` requests. |
-| `onUnauthorized` | `TokenRefresher?` | `null` | Called after a `401`/`403`; returns the token for the single retry. |
-| `userAgentProvider` | `UserAgentProvider?` | `null` | Supplies the `user-agent` header; the value is lowercased before sending. |
-| `authScheme` | `String` | `'Bearer'` | Scheme prepended to the token in the `authorization` header. |
-| `authTokenKey` | `String` | `'token'` | Key passed to `TokenStore.read` when loading the token. |
-| `defaultHeaders` | `Map<String, String>` | `const {}` | Headers applied to every request, matched case-insensitively. |
-| `timeout` | `Duration` | `Duration(seconds: 30)` | Default timeout for each HTTP exchange. |
-
-### Request methods
-
-Both methods resolve `path` relative to `baseUrl` and return the decoded body
-as `T?`, or `null` for an empty successful body.
-
-| Method | Signature | Notes |
+| Parameter | Default | Purpose |
 | --- | --- | --- |
-| `get<T>` | `get<T>(path, {headers, query, auth = false, timeout, decoder, debug = false})` | Sends `GET`. |
-| `post<T>` | `post<T>(path, {body, headers, query, auth = false, timeout, decoder, debug = false})` | JSON-encodes `body` and sends `application/json` unless a caller-supplied `content-type` header wins. |
+| `baseUrl` | required | Prefix for every request path. A trailing `/` is added when missing. |
+| `client` | `null` | Injected `http.Client`. `close()` leaves it open. |
+| `tokenStore` | required | Reads the token for `auth: true` requests. |
+| `onUnauthorized` | `null` | Refreshes the token after a `401` or `403`. |
+| `userAgentProvider` | `null` | Supplies the `user-agent` header. The value is lowercased. |
+| `authScheme` | `'Bearer'` | Scheme in the `authorization` header. |
+| `authTokenKey` | `'token'` | Key for `TokenStore.read`. |
+| `defaultHeaders` | `const {}` | Headers for every request. |
+| `timeout` | 30 seconds | Default timeout for one exchange. |
 
-`T` is inferred from the call site, for example
-`client.get<List<dynamic>>('items')`, or produced by `decoder`, a
-`T Function(dynamic json)` applied to the decoded JSON. Without a `decoder`
-the decoded value is cast to `T?`.
+## Requests
 
-## Auth tokens
-
-The client never persists tokens itself; it reads them through the
-`TokenStore` interface:
-
-```dart
-abstract interface class TokenStore {
-  Future<String?> read(String key);
-}
-```
-
-A minimal implementation backed by a map:
+`get` and `post` resolve `path` relative to `baseUrl` and return the decoded
+body as `T?`, or `null` for an empty successful body:
 
 ```dart
-class AppTokenStore implements TokenStore {
-  final Map<String, String> _tokens = {};
+final List<dynamic> items = await client.get<List<dynamic>>('items');
 
-  @override
-  Future<String?> read(String key) async => _tokens[key];
-
-  Future<void> write(String key, String token) async => _tokens[key] = token;
-}
-```
-
-When a request is made with `auth: true`, the client reads
-`tokenStore.read(authTokenKey)` and sends the header
-`authorization: <authScheme> <token>`. When no token exists, or the stored
-value is empty, the header is omitted. Customize the key and scheme per base
-URL:
-
-```dart
-final store = AppTokenStore();
-
-Future<String?> refreshPosToken() async {
-  return store.read('posRefreshToken');
-}
-
-final posClient = JsonRestClient(
-  baseUrl: 'https://pos.example.com/api/',
-  tokenStore: store,
-  authScheme: 'JWT',
-  authTokenKey: 'posToken',
-  onUnauthorized: refreshPosToken,
+final Map<String, dynamic> created = await client.post<Map<String, dynamic>>(
+  'items',
+  body: {'name': 'bolt'},
+  auth: true,
 );
 ```
 
-## Refresh semantics
+Pass a `decoder` to build `T` from the decoded JSON. Pass query parameters
+with `query`. Do not put a query string in `path`. A per-call `timeout`
+overrides the default.
 
-When a response has status `401` or `403`:
+`sendRaw` returns a `RestResponse` for every status and does not throw for
+non-success statuses:
 
-1. If `onUnauthorized` is `null`, an `UnauthorizedException` is thrown.
-2. Otherwise `onUnauthorized` is called. Concurrent unauthorized responses on
-   the same client share one in-flight refresh (single-flight); the callback
-   runs once per refresh burst.
-3. The token returned by the callback is used for exactly one retry of the
-   original request. The retry does not re-read the `TokenStore`.
-4. If the callback returns `null` or an empty string, or if the retry is still
-   `401`/`403`, an `UnauthorizedException` is thrown.
-5. If the callback itself throws, that error propagates to the caller.
+```dart
+final RestResponse response = await client.sendRaw(
+  'GET',
+  path: 'items',
+  maxResponseBytes: 1000000,
+);
+print(response.statusCode);
+print(response.headers);
+print(response.body);
+```
 
-Implementations should persist the new token to their `TokenStore` so later
-requests pick it up; the client does not write it back.
+## Auth and refresh
+
+With `auth: true`, the client reads `tokenStore.read(authTokenKey)` and sends
+`authorization: <authScheme> <token>`. When no token exists, it omits the
+header.
+
+When a response is `401` or `403`:
+
+1. Without `onUnauthorized`, the client throws an `UnauthorizedException`.
+2. Concurrent unauthorized responses on one client share one refresh. The
+   callback runs once per burst.
+3. The returned token is used for one retry of the original request.
+4. A `null`, empty, or still-unauthorized result throws an
+   `UnauthorizedException`.
+
+The client does not write the new token back. Persist it in your `TokenStore`
+so later requests use it.
 
 ## Headers
 
-Header names are matched case-insensitively and merged in this order, with
-later entries winning:
+Header names match case-insensitively. Later entries win in this order:
 
 1. `defaultHeaders` from the constructor.
-2. Computed `user-agent` (from `userAgentProvider`) and `authorization` (for
-   `auth: true`).
-3. The default `content-type: application/json` for `POST` requests, applied
-   only when no `content-type` is present yet.
+2. The computed `user-agent` and `authorization` headers.
+3. The default `content-type: application/json` for `POST` requests.
 4. Per-call `headers`.
-
-## Paths, query, and timeouts
-
-- Paths are resolved relative to `baseUrl`, which is treated as a directory:
-  a trailing `/` is added when missing, and a leading `/` on the request path
-  is ignored. Absolute URI paths are not supported and should not be passed.
-- `path` must not contain a query string. Pass parameters with `query`; values
-  are URL-encoded.
-- The per-call `timeout` overrides the constructor default for that request.
 
 ## Exceptions
 
-Every failure detected by the client itself throws a subtype of the sealed
+Every failure that the client detects throws a subtype of the sealed
 `RestClientException`:
 
 | Exception | Condition |
 | --- | --- |
 | `NetworkException` | A `SocketException` or `http.ClientException` occurred. |
 | `RequestTimeoutException` | The exchange exceeded the timeout. |
-| `BadRequestException` | The server responded with `400`. |
-| `UnauthorizedException` | `401`/`403` with no usable refresh token, or the retry was still unauthorized. |
-| `NotFoundException` | The server responded with `404`. |
-| `ConflictDataException` | The server responded with `409`. |
-| `InvalidInputException` | The server responded with `422`. |
-| `ServerErrorException` | The server responded with `500` or any other non-2xx status. |
-| `DeserializationException` | The body was not valid JSON, or it could not be cast to `T`. |
+| `BadRequestException` | The server returned `400`. |
+| `UnauthorizedException` | `401` or `403` with no usable refresh token, or the retry was still unauthorized. |
+| `NotFoundException` | The server returned `404`. |
+| `ConflictDataException` | The server returned `409`. |
+| `InvalidInputException` | The server returned `422`. |
+| `ServerErrorException` | The server returned `500` or any other non-2xx status. |
+| `DeserializationException` | The body was not valid JSON, or the cast to `T` failed. |
+| `ResponseLimitException` | `sendRaw` exceeded `maxResponseBytes`. |
 
-Errors thrown by caller-supplied callbacks (`decoder`, `onUnauthorized`,
-`tokenStore`, `userAgentProvider`) and JSON-encoding failures of an unsupported
-`body` propagate unchanged.
-
-For HTTP status errors, `message` is the raw response body; the fallback
-`'HTTP <status>'` is used only when the body is empty.
+For HTTP status errors, `message` holds the raw response body. The fallback
+`'HTTP <status>'` is used only when the body is empty. Errors from
+caller-supplied callbacks propagate unchanged.
 
 ## Client ownership
 
-`close()` releases the `http.Client` created internally by the constructor.
-When a client is injected through the `client` parameter, `close()` does
-nothing and closing that client remains the caller's responsibility. Do not
-use the instance after calling `close()`.
+`close()` releases the `http.Client` that the constructor created. When you
+inject a client through the `client` parameter, `close()` does nothing and the
+client remains yours. Do not use the instance after `close()`.
 
 ## Platform support
 
-The package imports `dart:io` to detect `SocketException`, so it targets
-mobile, desktop, and server Dart applications. It is not supported on the web.
-
-## `debug` parameter
-
-`debug` is accepted on `get` and `post` for call-site compatibility and has no
-effect: the client never logs.
+The package imports `dart:io` to detect `SocketException`. It supports mobile,
+desktop, and server apps. Web is not supported.
 
 ## Example
 
-See [`example/main.dart`](example/main.dart) for a runnable CLI that calls a
-real public JSON endpoint.
+See [`example/main.dart`](example/main.dart) for a runnable CLI.
