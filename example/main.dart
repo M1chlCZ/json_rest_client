@@ -2,7 +2,7 @@ import 'package:json_rest_client/json_rest_client.dart';
 
 /// In-memory [TokenStore] used by the example app.
 ///
-/// A real app would read the token from secure storage instead.
+/// A real app reads the token from secure storage instead.
 class ExampleTokenStore implements TokenStore {
   /// Creates a store that returns [token] for every key.
   ExampleTokenStore({this.token});

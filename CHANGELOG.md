@@ -1,3 +1,7 @@
+## 0.1.3
+
+- Documentation and internal cleanup.
+
 ## 0.1.2
 
 - Rewrite the README. Document `sendRaw`, `RestResponse`,

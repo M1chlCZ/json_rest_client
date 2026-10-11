@@ -10,8 +10,8 @@ import 'token_store.dart';
 
 /// Obtains a fresh authentication token, or `null` when refreshing failed.
 ///
-/// The returned token is used for the single retry. Implementations usually
-/// also persist it to their `TokenStore` so later requests pick it up.
+/// The returned token is used for one retry. Implementations usually also
+/// persist it to their `TokenStore` so later requests use it.
 typedef TokenRefresher = Future<String?> Function();
 
 /// Resolves the `user-agent` value used for outgoing requests.
@@ -46,7 +46,7 @@ class RestResponse {
 /// storage, user-agent injection, and single-flight refresh-on-`401` retries.
 ///
 /// Request paths are always resolved relative to [baseUrl]; a leading `/` on a
-/// path is ignored. Absolute URI paths are not supported and should not be
+/// path is ignored. Absolute URI paths are not supported and must not be
 /// passed.
 ///
 /// Instances are reusable for the lifetime of the app. When no [http.Client] is
@@ -56,12 +56,13 @@ class RestResponse {
 class JsonRestClient {
   /// Creates a client for [baseUrl], treated as a directory prefix.
   ///
-  /// [baseUrl] is resolved against request paths, so it should end with `/`.
+  /// [baseUrl] is resolved against request paths; a trailing `/` is added when
+  /// it is missing.
   /// [tokenStore] is consulted only for [auth] requests and only by
   /// [authTokenKey]. [onUnauthorized] is called at most once per refresh burst
   /// after a `401` or `403`; when it is `null` those responses throw
-  /// [UnauthorizedException] immediately. The token it returns is used for the
-  /// single retry. [userAgentProvider] supplies the `user-agent` header,
+  /// [UnauthorizedException] immediately. The token it returns is used for one
+  /// retry. [userAgentProvider] supplies the `user-agent` header,
   /// lowercased before it is sent. [defaultHeaders] are applied to every
   /// request, matched case-insensitively, and can be overridden per call.
   /// [timeout] is the default per-request timeout.
@@ -89,7 +90,7 @@ class JsonRestClient {
 
   /// Refreshes the token after a `401` or `403` response.
   ///
-  /// The returned token is used for the single retry.
+  /// The returned token is used for one retry.
   final TokenRefresher? onUnauthorized;
 
   /// Supplies the `user-agent` header value, lowercased before sending.
@@ -102,7 +103,7 @@ class JsonRestClient {
   final String authTokenKey;
 
   /// Unmodifiable headers sent with every request, matched
-  /// case-insensitively; per-call headers take precedence.
+  /// case-insensitively; per-call headers override them.
   final Map<String, String> defaultHeaders;
 
   /// Default timeout applied to each HTTP exchange.
@@ -198,10 +199,11 @@ class JsonRestClient {
   /// Provide either [path], which resolves relative to [baseUrl] with the same
   /// rules as [get], or an absolute [url]; providing both or neither throws an
   /// [ArgumentError]. [body] is JSON-encoded when it is not `null`. Headers
-  /// merge in the same order as [get] and [post]: [defaultHeaders], the
-  /// computed `user-agent`, an `application/json` content type when [body] is
-  /// not `null`, then per-call [headers]; names match case-insensitively and
-  /// per-call values win. [timeout] overrides [timeout] for this call.
+  /// merge in the same order as [get] and [post]. First [defaultHeaders], then
+  /// the computed `user-agent`, then an `application/json` content type when
+  /// [body] is not `null`, then per-call [headers]. Names match
+  /// case-insensitively and per-call values override earlier entries.
+  /// [timeout] overrides [timeout] for this call.
   ///
   /// A [RestResponse] is returned for every HTTP status; non-success statuses
   /// do not throw and the refresh-on-`401` path is not used. When
@@ -483,11 +485,6 @@ class JsonRestClient {
         headers: headers,
       ),
       422 => InvalidInputException(
-        message,
-        statusCode: statusCode,
-        headers: headers,
-      ),
-      500 => ServerErrorException(
         message,
         statusCode: statusCode,
         headers: headers,
