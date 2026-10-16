@@ -6,6 +6,7 @@ import 'dart:typed_data';
 import 'package:http/http.dart' as http;
 
 import 'errors.dart';
+import 'retry_policy.dart';
 import 'token_store.dart';
 
 /// Obtains a fresh authentication token, or `null` when refreshing failed.
@@ -16,6 +17,21 @@ typedef TokenRefresher = Future<String?> Function();
 
 /// Resolves the `user-agent` value used for outgoing requests.
 typedef UserAgentProvider = Future<String> Function();
+
+/// Called before one HTTP exchange starts.
+typedef RequestInterceptor = void Function(String method, Uri url);
+
+/// Called after one HTTP exchange completes with a response.
+///
+/// [statusCode] is the HTTP status and [duration] measures the exchange.
+typedef ResponseInterceptor =
+    void Function(String method, Uri url, int statusCode, Duration duration);
+
+/// Called after one HTTP exchange fails with [error].
+///
+/// [duration] measures the time until the failure.
+typedef ErrorInterceptor =
+    void Function(String method, Uri url, Object error, Duration duration);
 
 /// A raw HTTP response returned by [JsonRestClient.sendRaw].
 ///
@@ -43,7 +59,8 @@ class RestResponse {
 }
 
 /// A small JSON-over-HTTP client with typed exceptions, pluggable token
-/// storage, user-agent injection, and single-flight refresh-on-`401` retries.
+/// storage, user-agent injection, single-flight refresh-on-`401` retries,
+/// retry policies with backoff, and per-exchange interceptor hooks.
 ///
 /// Request paths are always resolved relative to [baseUrl]; a leading `/` on a
 /// path is ignored. Absolute URI paths are not supported and must not be
@@ -65,7 +82,9 @@ class JsonRestClient {
   /// retry. [userAgentProvider] supplies the `user-agent` header,
   /// lowercased before it is sent. [defaultHeaders] are applied to every
   /// request, matched case-insensitively, and can be overridden per call.
-  /// [timeout] is the default per-request timeout.
+  /// [timeout] is the default per-request timeout. [retryPolicy] enables
+  /// automatic retries of transient failures. [onRequest], [onResponse], and
+  /// [onError] observe every HTTP exchange, including each retry attempt.
   JsonRestClient({
     required String baseUrl,
     http.Client? client,
@@ -76,6 +95,10 @@ class JsonRestClient {
     this.authTokenKey = 'token',
     Map<String, String> defaultHeaders = const {},
     this.timeout = const Duration(seconds: 30),
+    this.retryPolicy,
+    this.onRequest,
+    this.onResponse,
+    this.onError,
   }) : baseUrl = baseUrl,
        defaultHeaders = Map.unmodifiable(defaultHeaders),
        _baseUri = _resolveBaseUri(baseUrl),
@@ -109,10 +132,29 @@ class JsonRestClient {
   /// Default timeout applied to each HTTP exchange.
   final Duration timeout;
 
+  /// Retries transient failures when set; `null` disables retries.
+  final RetryPolicy? retryPolicy;
+
+  /// Called before every HTTP exchange.
+  final RequestInterceptor? onRequest;
+
+  /// Called after every HTTP exchange that completes with a response.
+  final ResponseInterceptor? onResponse;
+
+  /// Called after every HTTP exchange that fails with an error.
+  final ErrorInterceptor? onError;
+
   final http.Client _client;
   final Uri _baseUri;
   final bool _ownsClient;
   Future<String?>? _refreshInFlight;
+
+  static const Set<String> _idempotentMethods = {
+    'GET',
+    'HEAD',
+    'PUT',
+    'DELETE',
+  };
 
   /// Closes the internally created HTTP client.
   ///
@@ -134,7 +176,8 @@ class JsonRestClient {
   /// [defaultHeaders] for this call. [auth] sends the token read from
   /// [tokenStore] as `<authScheme> <token>`; when no token exists the header is
   /// omitted. After a `401` or `403`, the token returned by [onUnauthorized] is
-  /// used for one retry. [timeout] overrides [timeout] for this call.
+  /// used for one retry. [timeout] overrides [timeout] for this call. When
+  /// [retryPolicy] is set, each exchange follows that policy.
   ///
   /// A successful response with an empty body returns `null`. Otherwise the
   /// body is JSON-decoded and passed to [decoder] when provided; without a
@@ -203,7 +246,8 @@ class JsonRestClient {
   /// the computed `user-agent`, then an `application/json` content type when
   /// [body] is not `null`, then per-call [headers]. Names match
   /// case-insensitively and per-call values override earlier entries.
-  /// [timeout] overrides [timeout] for this call.
+  /// [timeout] overrides [timeout] for this call. When [retryPolicy] is set,
+  /// each exchange follows that policy.
   ///
   /// A [RestResponse] is returned for every HTTP status; non-success statuses
   /// do not throw and the refresh-on-`401` path is not used. When
@@ -231,23 +275,24 @@ class JsonRestClient {
       isPost: body != null,
       extra: headers,
     );
-    try {
-      return await _sendRaw(
+    return _runWithRetry<RestResponse>(
+      method: method,
+      send: () => _observe<RestResponse>(
         method: method,
         uri: uri,
-        headers: requestHeaders,
-        body: body,
-        maxResponseBytes: maxResponseBytes,
-      ).timeout(requestTimeout);
-    } on TimeoutException {
-      throw RequestTimeoutException(
-        '$method $uri timed out after ${requestTimeout.inMilliseconds} ms',
-      );
-    } on SocketException catch (error) {
-      throw NetworkException(error.message);
-    } on http.ClientException catch (error) {
-      throw NetworkException(error.message);
-    }
+        send: () => _sendRaw(
+          method: method,
+          uri: uri,
+          headers: requestHeaders,
+          body: body,
+          timeout: requestTimeout,
+          maxResponseBytes: maxResponseBytes,
+        ),
+        statusOf: (response) => response.statusCode,
+      ),
+      statusOf: (response) => response.statusCode,
+      retryAfterOf: (response) => response.headers['retry-after'],
+    );
   }
 
   Future<T?> _request<T>({
@@ -264,7 +309,7 @@ class JsonRestClient {
     final requestTimeout = timeout ?? this.timeout;
     final isPost = method == 'POST';
 
-    var response = await _send(
+    var response = await _sendWithRetry(
       method: method,
       uri: uri,
       headers: await _buildHeaders(auth: auth, isPost: isPost, extra: headers),
@@ -291,7 +336,7 @@ class JsonRestClient {
           headers: response.headers,
         );
       }
-      response = await _send(
+      response = await _sendWithRetry(
         method: method,
         uri: uri,
         headers: await _buildHeaders(
@@ -359,6 +404,91 @@ class JsonRestClient {
     return headers;
   }
 
+  Future<http.Response> _sendWithRetry({
+    required String method,
+    required Uri uri,
+    required Map<String, String> headers,
+    required Duration timeout,
+    Object? body,
+  }) {
+    return _runWithRetry<http.Response>(
+      method: method,
+      send: () => _observe<http.Response>(
+        method: method,
+        uri: uri,
+        send: () => _send(
+          method: method,
+          uri: uri,
+          headers: headers,
+          timeout: timeout,
+          body: body,
+        ),
+        statusOf: (response) => response.statusCode,
+      ),
+      statusOf: (response) => response.statusCode,
+      retryAfterOf: (response) => response.headers['retry-after'],
+    );
+  }
+
+  Future<T> _runWithRetry<T>({
+    required String method,
+    required Future<T> Function() send,
+    required int Function(T value) statusOf,
+    required String? Function(T value) retryAfterOf,
+  }) async {
+    var attempt = 1;
+    while (true) {
+      try {
+        final value = await send();
+        final policy = retryPolicy;
+        if (policy != null &&
+            _canRetry(policy, method, attempt) &&
+            policy.retryableStatuses.contains(statusOf(value))) {
+          await Future<void>.delayed(
+            policy.delayFor(attempt, retryAfterOf(value)),
+          );
+          attempt++;
+          continue;
+        }
+        return value;
+      } on NetworkException {
+        final policy = retryPolicy;
+        if (policy == null || !_canRetry(policy, method, attempt)) {
+          rethrow;
+        }
+        await Future<void>.delayed(policy.delayFor(attempt, null));
+        attempt++;
+      }
+    }
+  }
+
+  Future<T> _observe<T>({
+    required String method,
+    required Uri uri,
+    required Future<T> Function() send,
+    required int Function(T value) statusOf,
+  }) async {
+    final stopwatch = Stopwatch()..start();
+    onRequest?.call(method, uri);
+    T value;
+    try {
+      value = await send();
+    } catch (error) {
+      onError?.call(method, uri, error, stopwatch.elapsed);
+      rethrow;
+    }
+    onResponse?.call(method, uri, statusOf(value), stopwatch.elapsed);
+    return value;
+  }
+
+  bool _canRetry(RetryPolicy policy, String method, int attempt) {
+    if (attempt >= policy.maxAttempts) {
+      return false;
+    }
+    return policy.retryNonIdempotent ||
+        _idempotentMethods.contains(method.toUpperCase());
+  }
+
   Future<http.Response> _send({
     required String method,
     required Uri uri,
@@ -400,6 +530,33 @@ class JsonRestClient {
   }
 
   Future<RestResponse> _sendRaw({
+    required String method,
+    required Uri uri,
+    required Map<String, String> headers,
+    required Duration timeout,
+    Object? body,
+    int? maxResponseBytes,
+  }) async {
+    try {
+      return await _readRaw(
+        method: method,
+        uri: uri,
+        headers: headers,
+        body: body,
+        maxResponseBytes: maxResponseBytes,
+      ).timeout(timeout);
+    } on TimeoutException {
+      throw RequestTimeoutException(
+        '$method $uri timed out after ${timeout.inMilliseconds} ms',
+      );
+    } on SocketException catch (error) {
+      throw NetworkException(error.message);
+    } on http.ClientException catch (error) {
+      throw NetworkException(error.message);
+    }
+  }
+
+  Future<RestResponse> _readRaw({
     required String method,
     required Uri uri,
     required Map<String, String> headers,

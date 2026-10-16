@@ -40,6 +40,11 @@ void main() {
     MockClient httpClient, {
     TokenRefresher? onUnauthorized,
     UserAgentProvider? userAgentProvider,
+    RetryPolicy? retryPolicy,
+    RequestInterceptor? onRequest,
+    ResponseInterceptor? onResponse,
+    ErrorInterceptor? onError,
+    Duration timeout = const Duration(milliseconds: 200),
   }) {
     return JsonRestClient(
       baseUrl: 'https://example.com/api/',
@@ -47,7 +52,11 @@ void main() {
       tokenStore: store,
       onUnauthorized: onUnauthorized,
       userAgentProvider: userAgentProvider ?? () async => 'App/1.0 (Test)',
-      timeout: const Duration(milliseconds: 200),
+      timeout: timeout,
+      retryPolicy: retryPolicy,
+      onRequest: onRequest,
+      onResponse: onResponse,
+      onError: onError,
     );
   }
 
@@ -446,5 +455,404 @@ void main() {
       client.sendRaw('GET', path: 'x', maxResponseBytes: 16),
       throwsA(isA<ResponseLimitException>()),
     );
+  });
+
+  group('RetryPolicy.delayFor', () {
+    const policy = RetryPolicy(baseDelay: Duration(milliseconds: 100));
+
+    test('applies jittered exponential bounds to the backoff', () {
+      for (var i = 0; i < 30; i++) {
+        expect(
+          policy.delayFor(1, null).inMicroseconds,
+          inInclusiveRange(100000, 200000),
+        );
+        expect(
+          policy.delayFor(2, null).inMicroseconds,
+          inInclusiveRange(200000, 400000),
+        );
+        expect(
+          policy.delayFor(3, null).inMicroseconds,
+          inInclusiveRange(400000, 800000),
+        );
+      }
+      const zero = RetryPolicy(baseDelay: Duration.zero);
+      expect(zero.delayFor(3, null), Duration.zero);
+    });
+
+    test('honors valid retry-after values exactly', () {
+      expect(policy.delayFor(1, '7'), const Duration(seconds: 7));
+      expect(policy.delayFor(3, '0'), Duration.zero);
+      expect(policy.delayFor(2, ' 12 '), const Duration(seconds: 12));
+    });
+
+    test('falls back to the backoff for malformed retry-after values', () {
+      for (final value in [null, '', 'abc', '-5', '1.5']) {
+        expect(
+          policy.delayFor(1, value).inMicroseconds,
+          inInclusiveRange(100000, 200000),
+        );
+      }
+    });
+  });
+
+  group('retries', () {
+    const policy = RetryPolicy(baseDelay: Duration(milliseconds: 1));
+
+    test('retries a retryable status and succeeds', () async {
+      var attempts = 0;
+      final client = clientWith(
+        MockClient((request) async {
+          attempts++;
+          return attempts == 1
+              ? http.Response('busy', 503)
+              : http.Response('{"ok":true}', 200);
+        }),
+        retryPolicy: policy,
+      );
+
+      expect(await client.get('items'), {'ok': true});
+      expect(attempts, 2);
+    });
+
+    test('retries a network failure and succeeds', () async {
+      var attempts = 0;
+      final client = clientWith(
+        MockClient((request) async {
+          attempts++;
+          if (attempts == 1) {
+            throw const SocketException('reset');
+          }
+          return http.Response('{}', 200);
+        }),
+        retryPolicy: policy,
+      );
+
+      await client.get('items');
+      expect(attempts, 2);
+    });
+
+    test('stops after maxAttempts and throws the last error', () async {
+      var attempts = 0;
+      final client = clientWith(
+        MockClient((request) async {
+          attempts++;
+          return http.Response('busy', 503);
+        }),
+        retryPolicy: const RetryPolicy(
+          maxAttempts: 3,
+          baseDelay: Duration(milliseconds: 1),
+        ),
+      );
+
+      await expectLater(
+        client.get('items'),
+        throwsA(isA<ServerErrorException>()),
+      );
+      expect(attempts, 3);
+    });
+
+    test('does not retry POST by default', () async {
+      var attempts = 0;
+      final client = clientWith(
+        MockClient((request) async {
+          attempts++;
+          return http.Response('busy', 503);
+        }),
+        retryPolicy: policy,
+      );
+
+      await expectLater(
+        client.post('items'),
+        throwsA(isA<ServerErrorException>()),
+      );
+      expect(attempts, 1);
+    });
+
+    test('retries POST when retryNonIdempotent is true', () async {
+      var attempts = 0;
+      final client = clientWith(
+        MockClient((request) async {
+          attempts++;
+          return attempts == 1
+              ? http.Response('busy', 503)
+              : http.Response('{}', 200);
+        }),
+        retryPolicy: const RetryPolicy(
+          baseDelay: Duration(milliseconds: 1),
+          retryNonIdempotent: true,
+        ),
+      );
+
+      expect(await client.post('items', body: {'a': 1}), <String, dynamic>{});
+      expect(attempts, 2);
+    });
+
+    test('never retries timeouts', () async {
+      var attempts = 0;
+      final client = clientWith(
+        MockClient((request) async {
+          attempts++;
+          await Future<void>.delayed(const Duration(seconds: 1));
+          return http.Response('{}', 200);
+        }),
+        retryPolicy: const RetryPolicy(
+          maxAttempts: 3,
+          baseDelay: Duration(milliseconds: 1),
+        ),
+      );
+
+      await expectLater(
+        client.get('slow'),
+        throwsA(isA<RequestTimeoutException>()),
+      );
+      expect(attempts, 1);
+    });
+
+    test('honors retry-after zero without waiting for the backoff', () async {
+      var attempts = 0;
+      final client = clientWith(
+        MockClient((request) async {
+          attempts++;
+          return attempts == 1
+              ? http.Response('busy', 429, headers: {'retry-after': '0'})
+              : http.Response('{}', 200);
+        }),
+        retryPolicy: const RetryPolicy(baseDelay: Duration(seconds: 30)),
+      );
+
+      expect(await client.get('items'), <String, dynamic>{});
+      expect(attempts, 2);
+    });
+
+    test('retries sendRaw requests with an idempotent method', () async {
+      var attempts = 0;
+      final client = clientWith(
+        MockClient((request) async {
+          attempts++;
+          return attempts == 1
+              ? http.Response('busy', 503)
+              : http.Response('{}', 200);
+        }),
+        retryPolicy: policy,
+      );
+
+      final response = await client.sendRaw('PUT', path: 'items');
+      expect(response.statusCode, 200);
+      expect(attempts, 2);
+    });
+
+    test('sendRaw does not retry POST by default', () async {
+      var attempts = 0;
+      final client = clientWith(
+        MockClient((request) async {
+          attempts++;
+          return http.Response('busy', 503);
+        }),
+        retryPolicy: policy,
+      );
+
+      final response = await client.sendRaw('POST', path: 'items');
+      expect(response.statusCode, 503);
+      expect(attempts, 1);
+    });
+
+    test('sendRaw retries a network failure', () async {
+      var attempts = 0;
+      final client = clientWith(
+        MockClient((request) async {
+          attempts++;
+          if (attempts == 1) {
+            throw const SocketException('reset');
+          }
+          return http.Response('{}', 200);
+        }),
+        retryPolicy: policy,
+      );
+
+      final response = await client.sendRaw('GET', path: 'items');
+      expect(response.statusCode, 200);
+      expect(attempts, 2);
+    });
+  });
+
+  group('interceptors', () {
+    test('observes a successful exchange in order', () async {
+      final events = <String>[];
+      Duration? responseDuration;
+      final client = clientWith(
+        MockClient((request) async => http.Response('{}', 200)),
+        onRequest: (method, url) => events.add('request $method $url'),
+        onResponse: (method, url, status, duration) {
+          events.add('response $method $url $status');
+          responseDuration = duration;
+        },
+        onError: (method, url, error, duration) => events.add('error'),
+      );
+
+      await client.get('items');
+
+      expect(events, [
+        'request GET https://example.com/api/items',
+        'response GET https://example.com/api/items 200',
+      ]);
+      expect(responseDuration, greaterThanOrEqualTo(Duration.zero));
+    });
+
+    test('reports a network failure through onError', () async {
+      final errors = <Object>[];
+      var responses = 0;
+      final client = clientWith(
+        MockClient((request) async => throw const SocketException('down')),
+        onRequest: (method, url) {},
+        onResponse: (method, url, status, duration) => responses++,
+        onError: (method, url, error, duration) => errors.add(error),
+      );
+
+      await expectLater(client.get('items'), throwsA(isA<NetworkException>()));
+      expect(responses, 0);
+      expect(errors.single, isA<NetworkException>());
+    });
+
+    test('fires once per retry attempt', () async {
+      var attempts = 0;
+      final statuses = <int>[];
+      final client = clientWith(
+        MockClient((request) async {
+          attempts++;
+          return attempts == 1
+              ? http.Response('busy', 503)
+              : http.Response('{}', 200);
+        }),
+        retryPolicy: const RetryPolicy(baseDelay: Duration(milliseconds: 1)),
+        onResponse: (method, url, status, duration) => statuses.add(status),
+      );
+
+      await client.get('items');
+      expect(attempts, 2);
+      expect(statuses, [503, 200]);
+    });
+
+    test('fires once per refresh attempt', () async {
+      store.token = 'old';
+      var attempts = 0;
+      var requests = 0;
+      final statuses = <int>[];
+      final client = clientWith(
+        MockClient((request) async {
+          attempts++;
+          return attempts == 1
+              ? http.Response('expired', 401)
+              : http.Response('{}', 200);
+        }),
+        onUnauthorized: () async => 'new',
+        onRequest: (method, url) => requests++,
+        onResponse: (method, url, status, duration) => statuses.add(status),
+      );
+
+      await client.get('secure', auth: true);
+      expect(requests, 2);
+      expect(statuses, [401, 200]);
+    });
+
+    test('applies to sendRaw', () async {
+      var requests = 0;
+      final statuses = <int>[];
+      final client = clientWith(
+        MockClient((request) async => http.Response('{}', 201)),
+        onRequest: (method, url) {
+          requests++;
+          expect(method, 'POST');
+        },
+        onResponse: (method, url, status, duration) => statuses.add(status),
+      );
+
+      final response = await client.sendRaw('POST', path: 'items');
+      expect(response.statusCode, 201);
+      expect(requests, 1);
+      expect(statuses, [201]);
+    });
+
+    test('reports an HTTP status error as a response', () async {
+      final events = <String>[];
+      final client = clientWith(
+        MockClient((request) async => http.Response('boom', 500)),
+        onResponse: (method, url, status, duration) =>
+            events.add('response $status'),
+        onError: (method, url, error, duration) => events.add('error'),
+      );
+
+      await expectLater(
+        client.get('items'),
+        throwsA(isA<ServerErrorException>()),
+      );
+      expect(events, ['response 500']);
+    });
+  });
+
+  group('timeout overrides', () {
+    test('a shorter per-call timeout times out', () async {
+      final client = clientWith(
+        MockClient((request) async {
+          await Future<void>.delayed(const Duration(milliseconds: 300));
+          return http.Response('{}', 200);
+        }),
+        timeout: const Duration(seconds: 30),
+      );
+
+      await expectLater(
+        client.get('slow', timeout: const Duration(milliseconds: 50)),
+        throwsA(isA<RequestTimeoutException>()),
+      );
+    });
+
+    test('a longer per-call timeout succeeds', () async {
+      final client = clientWith(
+        MockClient((request) async {
+          await Future<void>.delayed(const Duration(milliseconds: 300));
+          return http.Response('{"ok":true}', 200);
+        }),
+        timeout: const Duration(milliseconds: 50),
+      );
+
+      expect(await client.get('slow', timeout: const Duration(seconds: 30)), {
+        'ok': true,
+      });
+    });
+
+    test('sendRaw honors a shorter per-call timeout', () async {
+      final client = clientWith(
+        MockClient((request) async {
+          await Future<void>.delayed(const Duration(milliseconds: 300));
+          return http.Response('{}', 200);
+        }),
+        timeout: const Duration(seconds: 30),
+      );
+
+      await expectLater(
+        client.sendRaw(
+          'GET',
+          path: 'slow',
+          timeout: const Duration(milliseconds: 50),
+        ),
+        throwsA(isA<RequestTimeoutException>()),
+      );
+    });
+
+    test('sendRaw honors a longer per-call timeout', () async {
+      final client = clientWith(
+        MockClient((request) async {
+          await Future<void>.delayed(const Duration(milliseconds: 300));
+          return http.Response('{}', 200);
+        }),
+        timeout: const Duration(milliseconds: 50),
+      );
+
+      final response = await client.sendRaw(
+        'GET',
+        path: 'slow',
+        timeout: const Duration(seconds: 30),
+      );
+      expect(response.statusCode, 200);
+    });
   });
 }

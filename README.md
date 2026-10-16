@@ -13,6 +13,8 @@ response-decoding and error-mapping code from an app's networking layer.
   failures
 - Auth tokens from a host-provided `TokenStore`
 - Single-flight token refresh on `401` or `403`, then one retry
+- `RetryPolicy` with exponential backoff, jitter, and `Retry-After` support
+- Sync `onRequest`, `onResponse`, and `onError` hooks for every exchange
 - Case-insensitive header merging with per-call overrides
 - Configurable base URL, timeout, auth scheme, token key, and headers
 
@@ -63,6 +65,10 @@ one `JsonRestClient` per base URL for the lifetime of the app.
 | `authTokenKey` | `'token'` | Key for `TokenStore.read`. |
 | `defaultHeaders` | `const {}` | Headers for every request. |
 | `timeout` | 30 seconds | Default timeout for one exchange. |
+| `retryPolicy` | `null` | Retries transient failures. `null` disables retries. |
+| `onRequest` | `null` | Runs before every HTTP exchange. |
+| `onResponse` | `null` | Runs after every exchange that receives a response. |
+| `onError` | `null` | Runs after every exchange that fails with an error. |
 
 ## Requests
 
@@ -96,6 +102,77 @@ print(response.statusCode);
 print(response.headers);
 print(response.body);
 ```
+
+## Retries
+
+Pass a `RetryPolicy` to retry transient failures:
+
+```dart
+final client = JsonRestClient(
+  baseUrl: 'https://api.example.com/v1/',
+  tokenStore: tokenStore,
+  retryPolicy: const RetryPolicy(
+    maxAttempts: 4,
+    baseDelay: Duration(milliseconds: 300),
+  ),
+);
+```
+
+`maxAttempts` counts every attempt, including the first one. The client
+retries `NetworkException` failures and responses with a status in
+`retryableStatuses` (`429`, `500`, `502`, `503`, `504` by default). Retries
+apply to `GET`, `HEAD`, `PUT`, and `DELETE`. Set
+`retryNonIdempotent: true` to retry `POST` and other methods. Timeouts are
+never retried.
+
+The delay grows exponentially with jitter. The delay for the first retry
+lies between `baseDelay` and `2 * baseDelay`. A `Retry-After` response header
+with a whole number of seconds overrides the computed delay. Call
+`RetryPolicy.delayFor(attempt, retryAfterHeader)` to compute the delay for
+one attempt.
+
+Without `retryPolicy`, the client performs one attempt per exchange.
+
+## Interceptors
+
+The client calls three optional hooks around every HTTP exchange, including
+each retry attempt and each refresh retry:
+
+```dart
+final client = JsonRestClient(
+  baseUrl: 'https://api.example.com/v1/',
+  tokenStore: tokenStore,
+  onRequest: (method, url) => print('-> $method $url'),
+  onResponse: (method, url, status, duration) =>
+      print('<- $status $method $url in $duration'),
+  onError: (method, url, error, duration) =>
+      print('!! $error $method $url in $duration'),
+);
+```
+
+Each exchange produces one `onRequest` call and then exactly one
+`onResponse` or `onError` call. `onResponse` reports every HTTP status,
+including error statuses that the client maps to exceptions afterwards.
+`onError` reports network and timeout failures. Exceptions from a hook
+propagate to the caller.
+
+## Timeouts
+
+The `timeout` constructor parameter sets the default timeout for one HTTP
+exchange, 30 seconds by default. Every request method accepts a `timeout`
+override:
+
+```dart
+await client.get('slow-report', timeout: const Duration(minutes: 2));
+
+final health = await client.sendRaw(
+  'GET',
+  path: 'health',
+  timeout: const Duration(seconds: 2),
+);
+```
+
+A timeout throws `RequestTimeoutException` and never triggers a retry.
 
 ## Auth and refresh
 

@@ -1,3 +1,13 @@
+## [0.2.0] - 2026-10-16
+
+- Added `RetryPolicy` with exponential backoff, jitter, exact `Retry-After`
+  support, per-status retry rules, and a `retryNonIdempotent` opt-in.
+- The client retries network failures and retryable statuses for `GET`,
+  `HEAD`, `PUT`, and `DELETE`; timeouts are never retried.
+- Added sync `onRequest`, `onResponse`, and `onError` interceptor hooks that
+  fire once per HTTP exchange, including retry and refresh attempts.
+- Added tests for the per-call timeout override on `get` and `sendRaw`.
+
 ## 0.1.3
 
 - Documentation and internal cleanup.
